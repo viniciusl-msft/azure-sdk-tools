@@ -17,6 +17,7 @@ Param (
 # Submit API review request and return status whether current revision is approved or pending or failed to create review
 function Submit-APIReview($packagename, $filePath, $uri, $apiKey, $apiLabel, $releaseStatus)
 {
+    Write-Host "FilePath $($filePath)"
     $multipartContent = [System.Net.Http.MultipartFormDataContent]::new()
     $FileStream = [System.IO.FileStream]::new($filePath, [System.IO.FileMode]::Open)
     $fileHeader = [System.Net.Http.Headers.ContentDispositionHeaderValue]::new("form-data")
@@ -71,12 +72,11 @@ function Submit-APIReview($packagename, $filePath, $uri, $apiKey, $apiLabel, $re
 Write-Host "Artifact path: $($ArtifactPath)"
 Write-Host "Package Name: $($PackageName)"
 Write-Host "Source branch: $($SourceBranch)"
-Write-Host "Config File directory: $($ConfigFileDir)"
 
-$packages = @{}
-if ($FindArtifactForApiReviewFn -and (Test-Path "Function:$FindArtifactForApiReviewFn"))
+if (Test-Path $ArtifactPath)
 {
-    $packages = &$FindArtifactForApiReviewFn $ArtifactPath $PackageName
+    $pkgFile = Get-ChildItem $ArtifactPath
+    $pkgPath = $pkgFile.FullName
 }
 else
 {
@@ -86,97 +86,89 @@ else
     exit(1)
 }
 
-# Check if package config file is present. This file has package version, SDK type etc info.
-if (-not $ConfigFileDir)
+$pkg = Split-Path -Leaf $pkgPath
+$pkgPropPath = "$(Split-Path -Path $pkgPath)/$(Split-Path -LeafBase $pkgPath).json"
+# ConfigFile must have the name name of the package + ".apiview.json"
+Write-Host "PKG $($pkgFile)"
+Write-Host "propPath $($pkgPropPath)"
+
+
+Write-Host $pkgPropPath
+
+if (-Not (Test-Path $pkgPropPath))
 {
-    $ConfigFileDir = Join-Path -Path $ArtifactPath "PackageInfo"
+    Write-Host " Package property file path $($pkgPropPath) is invalid."
+    continue
+}
+# Get package info from json file created before updating version to daily dev
+$pkgInfo = Get-Content $pkgPropPath | ConvertFrom-Json
+$version = [AzureEngSemanticVersion]::ParseVersionString($pkgInfo.Version)
+if ($version -eq $null)
+{
+    Write-Host "Version info is not available for package $PackageName, because version '$(pkgInfo.Version)' is invalid. Please check if the version follows Azure SDK package versioning guidelines."
+    exit 1
 }
 
-if ($packages)
+Write-Host "Version: $($version)"
+Write-Host "SDK Type: $($pkgInfo.SdkType)"
+Write-Host "Release Status: $($pkgInfo.ReleaseStatus)"
+
+# Run create review step only if build is triggered from main branch or if version is GA.
+# This is to avoid invalidating review status by a build triggered from feature branch
+if ( ($SourceBranch -eq $DefaultBranch) -or (-not $version.IsPrerelease))
 {
-    foreach($pkgPath in $packages.Values)
+    Write-Host "Submitting API Review for package $($pkg)"
+    $respCode = Submit-APIReview -packagename $pkg -filePath $pkgPath -uri $APIViewUri -apiKey $APIKey -apiLabel $APILabel -releaseStatus $pkgInfo.ReleaseStatus
+    Write-Host "HTTP Response code: $($respCode)"
+    # HTTP status 200 means API is in approved status
+    if ($respCode -eq '200')
     {
-        $pkg = Split-Path -Leaf $pkgPath
-        $pkgPropPath = Join-Path -Path $ConfigFileDir "$PackageName.json"
-        if (-Not (Test-Path $pkgPropPath))
+        Write-Host "API review is in approved status."
+    }
+    elseif ($version.IsPrerelease)
+    {
+        # Check if package name is approved. Preview version cannot be released without package name approval
+        if ($respCode -eq '202' -and $pkgInfo.ReleaseStatus -and $pkgInfo.ReleaseStatus -ne "Unreleased")
         {
-            Write-Host " Package property file path $($pkgPropPath) is invalid."
-            continue
-        }
-        # Get package info from json file created before updating version to daily dev
-        $pkgInfo = Get-Content $pkgPropPath | ConvertFrom-Json
-        $version = [AzureEngSemanticVersion]::ParseVersionString($pkgInfo.Version)
-        if ($version -eq $null)
-        {
-            Write-Host "Version info is not available for package $PackageName, because version '$(pkgInfo.Version)' is invalid. Please check if the version follows Azure SDK package versioning guidelines."
+            Write-Host "Package name is not yet approved on APIView for $($PackageName). Package name must be approved by an API approver for a beta release if it was never released a stable version."
+            Write-Host "You can check http://aka.ms/azsdk/engsys/apireview/faq for more details on package name approval."
             exit 1
         }
-
-        Write-Host "Version: $($version)"
-        Write-Host "SDK Type: $($pkgInfo.SdkType)"
-        Write-Host "Release Status: $($pkgInfo.ReleaseStatus)"
-
-        # Run create review step only if build is triggered from main branch or if version is GA.
-        # This is to avoid invalidating review status by a build triggered from feature branch
-        if ( ($SourceBranch -eq $DefaultBranch) -or (-not $version.IsPrerelease))
+        # Ignore API review status for prerelease version
+        Write-Host "Package version is not GA. Ignoring API view approval status"
+    }
+    elseif (!$pkgInfo.ReleaseStatus -or $pkgInfo.ReleaseStatus -eq "Unreleased")
+    {
+        Write-Host "Release date is not set for current version in change log file for package. Ignoring API review approval status since package is not yet ready for release."
+    }
+    else
+    {
+        # Return error code if status code is 201 for new data plane package
+        # Temporarily enable API review for spring SDK types. Ideally this should be done be using 'IsReviewRequired' method in language side
+        # to override default check of SDK type client
+        if (($pkgInfo.SdkType -eq "client" -or $pkgInfo.SdkType -eq "spring") -and $pkgInfo.IsNewSdk)
         {
-            Write-Host "Submitting API Review for package $($pkg)"
-            $respCode = Submit-APIReview -packagename $pkg -filePath $pkgPath -uri $APIViewUri -apiKey $APIKey -apiLabel $APILabel -releaseStatus $pkgInfo.ReleaseStatus
-            Write-Host "HTTP Response code: $($respCode)"
-            # HTTP status 200 means API is in approved status
-            if ($respCode -eq '200')
+            if ($respCode -eq '201')
             {
-                Write-Host "API review is in approved status."
-            }
-            elseif ($version.IsPrerelease)
-            {
-                # Check if package name is approved. Preview version cannot be released without package name approval
-                if ($respCode -eq '202' -and $pkgInfo.ReleaseStatus -and $pkgInfo.ReleaseStatus -ne "Unreleased")
-                {
-                    Write-Host "Package name is not yet approved on APIView for $($PackageName). Package name must be approved by an API approver for a beta release if it was never released a stable version."
-                    Write-Host "You can check http://aka.ms/azsdk/engsys/apireview/faq for more details on package name approval."
-                    exit 1
-                }
-                # Ignore API review status for prerelease version
-                Write-Host "Package version is not GA. Ignoring API view approval status"
-            }
-            elseif (!$pkgInfo.ReleaseStatus -or $pkgInfo.ReleaseStatus -eq "Unreleased")
-            {
-                Write-Host "Release date is not set for current version in change log file for package. Ignoring API review approval status since package is not yet ready for release."
+                Write-Host "Package version $($version) is GA and automatic API Review is not yet approved for package $($PackageName)."
+                Write-Host "Build and release is not allowed for GA package without API review approval."
+                Write-Host "You will need to queue another build to proceed further after API review is approved"
+                Write-Host "You can check http://aka.ms/azsdk/engsys/apireview/faq for more details on API Approval."
             }
             else
             {
-                # Return error code if status code is 201 for new data plane package
-                # Temporarily enable API review for spring SDK types. Ideally this should be done be using 'IsReviewRequired' method in language side
-                # to override default check of SDK type client
-                if (($pkgInfo.SdkType -eq "client" -or $pkgInfo.SdkType -eq "spring") -and $pkgInfo.IsNewSdk)
-                {
-                    if ($respCode -eq '201')
-                    {
-                        Write-Host "Package version $($version) is GA and automatic API Review is not yet approved for package $($PackageName)."
-                        Write-Host "Build and release is not allowed for GA package without API review approval."
-                        Write-Host "You will need to queue another build to proceed further after API review is approved"
-                        Write-Host "You can check http://aka.ms/azsdk/engsys/apireview/faq for more details on API Approval."
-                    }
-                    else
-                    {
-                        Write-Host "Failed to create API Review for package $($PackageName). Please reach out to Azure SDK engineering systems on teams channel and share this build details."
-                    }
-                    exit 1
-                }
-                else
-                {
-                    Write-Host "API review is not approved for package $($PackageName), however it is not required for this package type so it can still be released without API review approval."
-                }
+                Write-Host "Failed to create API Review for package $($PackageName). Please reach out to Azure SDK engineering systems on teams channel and share this build details."
             }
+            exit 1
         }
         else
         {
-            Write-Host "Build is triggered from $($SourceBranch) with prerelease version. Skipping API review status check."
+            Write-Host "API review is not approved for package $($PackageName), however it is not required for this package type so it can still be released without API review approval."
         }
     }
 }
 else
 {
-    Write-Host "No package is found in artifact path to submit review request"
+    Write-Host "Build is triggered from $($SourceBranch) with prerelease version. Skipping API review status check."
 }
+
